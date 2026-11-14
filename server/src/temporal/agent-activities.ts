@@ -1,0 +1,265 @@
+import { cancellationSignal, heartbeat } from "@temporalio/activity";
+
+import { runPlanner } from "../agents/planner/run";
+import type { AgentBasePayload, WorkflowPipelineState } from "./workflow-types";
+import { hasLlm } from "../lib/model";
+import {
+  mergeTodoStatusUpdates,
+  TodoItem,
+  updateTodoStatusForSubagent,
+} from "../lib/plan";
+import { savePlanMessage } from "../repository/message.repository";
+import { runDesigner } from "../agents/designer/run";
+import { runBuilder } from "../agents/builder/run";
+import { runReviewer } from "../agents/reviewer/run";
+import { readSandboxTree } from "../lib/sandbox";
+
+const HEARTBEAT_INTERVAL_MS = 5_000;
+
+type Beat = () => void;
+
+export async function withHeartbeat<T>(
+  run: (beat: Beat) => Promise<T>,
+): Promise<T> {
+  const beat: Beat = () => {
+    try {
+      heartbeat();
+    } catch (error) {
+      console.warn("Activity heartbeat failed:", error);
+    }
+  };
+
+  const ticker = setInterval(beat, HEARTBEAT_INTERVAL_MS);
+
+  try {
+    return await run(beat);
+  } finally {
+    clearInterval(ticker);
+  }
+}
+
+
+async function syncPlan(
+    projectId: string,
+    state: WorkflowPipelineState,
+    todos: TodoItem[],
+    activity?: { agent: string, detail: string} | null,
+) {
+    const saved = await savePlanMessage({
+        projectId,
+        messageId: state.planMessageId || "",
+        todos,
+        activity,
+    });
+    state.planMessageId = saved.id;
+
+}
+
+export async function runPlannerActivity(
+  input: AgentBasePayload,
+): Promise<WorkflowPipelineState> {
+    if(!hasLlm()) {
+        return {...input.state};
+    }
+
+
+    return withHeartbeat(async (beat) => {
+        const started = Date.now();
+        const state = { ...input.state };
+
+        const result = await runPlanner({ // actual agent logic
+            prompt: input.prompt,
+            thread: state.thread,
+            todos: state.todos,
+            signal: cancellationSignal(),
+            onProgress: beat,
+            onTodos: async (todos, activity) => {
+                state.todos = todos;
+                console.log("onTodos", todos, activity);
+                await syncPlan(input.projectId, state, todos, activity);
+                beat();
+            }
+
+        });
+
+        state.thread = result.thread;
+        state.todos = updateTodoStatusForSubagent(state.todos, "design_app", "start"); // move the design related todos to in_progress status from pending status
+
+        await syncPlan(input.projectId, state, state.todos, {
+            agent: "planner",
+            detail: "Handed off to designer",
+        });
+
+
+        return state;
+
+    })
+
+}
+
+
+export async function runDesignerActivity(
+  input: AgentBasePayload,
+): Promise<WorkflowPipelineState> {
+    if(!hasLlm()) {
+        return {...input.state};
+    }
+
+    return withHeartbeat(async (beat) => {
+        const state = { ...input.state };
+
+        await syncPlan(input.projectId, state, state.todos, {
+          agent: "designer",
+          detail: "designing the ui",
+        });
+
+        const result = await runDesigner({
+          prompt: input.prompt,
+          todos: state.todos,
+          thread: state.thread,
+          signal: cancellationSignal(),
+          onProgress: beat,
+          onTodos: async (_todos, activity) => {
+            if(activity) {
+              await syncPlan(input.projectId, state, state.todos, activity);
+            }
+            beat();
+          }
+        });
+
+        state.thread = result.thread;
+        state.design = result.design;
+
+        state.todos = updateTodoStatusForSubagent(state.todos, "design_app", "complete"); // move the design related todos to complete status from in_progress status
+
+        state.todos = updateTodoStatusForSubagent(state.todos, "build_app", "start"); // move the build related todos to in_progress status from pending status
+
+        await syncPlan(input.projectId, state, state.todos, {
+          agent: "designer",
+          detail: "design complete. handing off to builder",
+        });
+
+        return state;
+    })
+}
+
+export async function runReviewerActivity(
+  input: AgentBasePayload,
+): Promise<WorkflowPipelineState> {
+    if (!hasLlm()) {
+        return { ...input.state };
+    }
+
+    return withHeartbeat(async (beat) => {
+        const state = { ...input.state };
+
+        await syncPlan(input.projectId, state, state.todos, {
+            agent: "reviewer",
+            detail: "reviewing the app",
+        });
+
+        const result = await runReviewer({
+            sandboxId: input.sandboxId,
+            task: input.prompt,
+            design: state.design,
+            files: state.files,
+            thread: state.thread,
+            signal: cancellationSignal(),
+            onProgress: beat,
+            onTodos: async (_todos, activity) => {
+                if (activity) {
+                    await syncPlan(input.projectId, state, state.todos, activity);
+                }
+                beat();
+            },
+        });
+
+        state.thread = result.thread;
+        state.review = result.review;
+
+        await syncPlan(input.projectId, state, state.todos, {
+            agent: "reviewer",
+            detail: "review complete",
+        });
+
+        return state;
+    });
+}
+
+export async function runBuilderActivity(
+  input: AgentBasePayload & { task: string; fixPass?: boolean },
+): Promise<WorkflowPipelineState> {
+    if(!hasLlm()) {
+        return {...input.state};
+    }
+
+    return withHeartbeat(async (beat) => {
+        const state = { ...input.state };
+
+        await syncPlan(input.projectId, state, state.todos, {
+            agent: "builder",
+            detail: input.fixPass
+                ? "fixing must-fix items from review"
+                : "building the app",
+        });
+
+        const result = await runBuilder({
+            sandboxId: input.sandboxId,
+            task: input.task,
+            design: input.state.design,
+            files: input.state.files,
+            thread: input.state.thread,
+            todos: state.todos,
+            fixPass: input.fixPass,
+            signal: cancellationSignal(),
+            onProgress: beat,
+            onTodos: async (todos, activity) => {
+              if (todos.length > 0) {
+                state.todos = mergeTodoStatusUpdates(state.todos, todos);
+              }
+              if (activity) {
+                await syncPlan(input.projectId, state, state.todos, activity);
+              } else if (todos.length > 0) {
+                await syncPlan(input.projectId, state, state.todos, null);
+              }
+              beat();
+            },
+        });
+
+        state.thread = result.thread;
+        state.files = await readSandboxTree(input.sandboxId);
+        state.builderNotes = result.notes;
+
+        if (!input.fixPass) {
+            state.todos = updateTodoStatusForSubagent(
+                state.todos,
+                "build_app",
+                "complete",
+            );
+        }
+
+        await syncPlan(input.projectId, state, state.todos, {
+            agent: "builder",
+            detail: input.fixPass
+                ? "fixes applied; ready for another review"
+                : "builder complete. handing off to reviewer",
+        });
+
+        return state;
+    })
+}
+
+export async function finalizePlanActivity(
+  input: AgentBasePayload,
+): Promise<WorkflowPipelineState> {
+  const state = { ...input.state };
+
+  state.todos = updateTodoStatusForSubagent(state.todos, "review_app", "complete");
+
+  await syncPlan(input.projectId, state, state.todos, {
+    agent: "workflow",
+    detail: "App generation complete",
+  });
+
+  return state;
+}
